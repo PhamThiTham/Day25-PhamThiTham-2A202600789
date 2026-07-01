@@ -52,6 +52,35 @@ def discount_stack(
     return cache_mult * batch_mult
 
 
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+) -> bool:
+    """Determine if prompt caching is financially worthwhile.
+
+    Prompt caching has a one-time write cost (storing the prefix), and each read
+    is billed at read_discount × the normal price (e.g., 0.10 = 90% off).
+    Caching is worth it when total savings from reads exceed the write cost.
+
+    Args:
+        avg_cache_reads: Average number of times a cached prefix is read.
+        write_cost_per_m: Cost per million tokens to write/store the cache (USD).
+        read_discount: Fraction of the normal price for cached reads (default 0.10).
+
+    Returns:
+        True if caching is worth it (savings >= write cost), False otherwise.
+    """
+    if avg_cache_reads <= 0 or write_cost_per_m <= 0:
+        return False
+    # Savings per read = (1 - read_discount) * write_cost_per_m
+    # Total savings from all reads = reads * savings_per_read
+    savings_per_read = (1.0 - read_discount) * write_cost_per_m
+    total_savings = avg_cache_reads * savings_per_read
+    # Caching is worth it when total savings cover the one-time write cost
+    return total_savings >= write_cost_per_m
+
+
 def break_even_utilization(discount_frac: float) -> float:
     """Utilization at which a commitment pays off ~= 1 - discount.
 
@@ -60,18 +89,86 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+# Per-GPU interruption rates (illustrative): premium GPUs like H100 are less
+# likely to be reclaimed than cheaper ones like A10G.
+GPU_INTERRUPT_RATES = {
+    "H100": 0.03,
+    "H200": 0.02,
+    "A100": 0.05,
+    "A10G": 0.10,
+    "L4": 0.12,
+    "B200": 0.02,
+    "MI300X": 0.06,
+}
+
+# Reserved discount: 3yr is deeper than 1yr.
+RESERVED_1YR_DISCOUNT = 0.25  # rough: (od - 1yr) / od
+RESERVED_3YR_DISCOUNT = 0.45
+
+
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: int | None = None,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+    Enhanced version (Extension 1):
+      - Uses GPU-specific interruption rates for spot suitability.
+      - Compares 1yr vs 3yr reserved based on job duration.
+      - Falls back to original simple policy if gpu_type/job_days not provided.
+
+    Args:
+        hours_per_day: Daily GPU-hours for the workload.
+        interruptible: Whether the job can be interrupted.
+        reserved_discount: Base reserved discount (used if gpu_type not given).
+        gpu_type: Type of GPU (e.g. "H100", "A10G") for per-GPU rates.
+        job_days: Duration of the job in days (for 1yr vs 3yr comparison).
+
+    Returns:
+        "spot", "reserved", or "on_demand".
     """
     duty = max(0.0, hours_per_day) / 24.0
-    be = break_even_utilization(reserved_discount)
-    if interruptible and hours_per_day < 24:
-        return "spot"
+
+    # Factor 1: Interruption rate by GPU type — if interruptible & low interruption
+    # risk, spot is even more attractive; if high interruption risk, reserve may win.
+    interrupt_rate = GPU_INTERRUPT_RATES.get(gpu_type, 0.05) if gpu_type else 0.05
+
+    # Factor 2: Choose the best reserved term based on job duration.
+    # If job_days is given and closer to 1yr (~365d), use 1yr pricing.
+    # If job_days is closer to 3yr (~1095d), use 3yr pricing.
+    if job_days is not None and gpu_type is not None:
+        # 1yr reserved discount is shallower; 3yr is deeper
+        if job_days >= 730:  # >= 2 years → 3yr reserved
+            effective_discount = RESERVED_3YR_DISCOUNT
+        elif job_days >= 300:  # ~1 year → 1yr reserved
+            effective_discount = RESERVED_1YR_DISCOUNT
+        else:
+            effective_discount = reserved_discount
+    else:
+        effective_discount = reserved_discount
+
+    be = break_even_utilization(effective_discount)
+
+    # Tier decision logic
+    if interruptible:
+        if hours_per_day < 24:
+            # Spot is better for interruptible jobs, but only if interruption
+            # rate is low enough — otherwise reserved or on_demand wins.
+            if interrupt_rate <= 0.08:  # low interruption risk → spot
+                return "spot"
+            # High interruption rate: even interruptible jobs may prefer reserved
+            if duty >= be:
+                return "reserved"
+            return "on_demand"
+        # 24/7 interruptible is unusual — treat as reserved if high duty
+        elif duty >= be:
+            return "reserved"
+        return "on_demand"
+
+    # Non-interruptible: standard duty-based logic
     if duty >= be:
         return "reserved"
     return "on_demand"
